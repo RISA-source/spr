@@ -1045,7 +1045,241 @@ patterns many times. In short test runs they stay novel. In real corpora they wo
 
 ---
 
-*Next: v3.0 — Active Recall / Generation (pattern → predict continuation)*
+---
+
+## BUILDLOG: v3.0 — Active Recall
+
+**What changed architecturally:**
+Every version up to v2.3 only did recognition: input → what is this?
+v3.0 adds the reverse direction: pattern → what does this produce?
+
+This is the flip from perception to imagination. Together they give the system
+both modes a complete cognitive loop has.
+
+---
+
+### Four capabilities built
+
+**New module:** `recall.py` — `RecallEngine` class wrapping `PatternMemory` + raw text banks.
+
+The engine needs the raw text examples, not just SDRs. So `SymPattern.teach()` was
+updated to store all raw text in `self._text_bank: dict[str, list[str]]`.
+`RecallEngine` is lazy-initialized on first access via `sp.recall` property,
+rebuilt whenever new patterns are taught.
+
+---
+
+**1. Completion** — given a partial input, suggest what comes next.
+
+```python
+sp.complete("the cat sat")     → "on the mat"   [animal 0.941]
+sp.complete("neural networks") → "learn from data" [tech 0.941]
+sp.complete("heavy rain")      → "fell all morning" [weather 0.882]
+```
+
+Strategy:
+1. Encode partial input as SDR
+2. Match against all pattern prototypes
+3. For each matching pattern, find the stored example whose SDR is closest
+4. Extract the suffix (words beyond the partial) as the completion
+5. Rank by match confidence
+
+Works well when partial overlaps with taught examples directly.
+Limitation: doesn't generate new text, only retrieves and slices stored examples.
+
+---
+
+**2. Expectation** — given a pattern label, return a typical instance.
+
+```python
+sp.expect("animal") → "fish swim in the deep ocean"  (proto_score=0.373)
+sp.expect("tech")   → "deep learning uses many layers"  (proto_score=0.451)
+```
+
+Strategy: scores all stored examples against the prototype and returns the
+most central one — the instance that best represents the average of everything
+the system has learned about that pattern.
+
+The "typical instance" is useful for: generating default content when a
+pattern fires, seeding a conversation, or explaining what a category means.
+
+---
+
+**3. Analogy** — A is to B as C is to ?
+
+```python
+# With parallel-structured training data:
+sp.analogy("kitten", "cat", "foal") → "horse"   conf=0.275  ✓
+sp.analogy("puppy",  "dog", "foal") → "horse"   conf=0.216  ✓
+```
+
+**First approach: XOR transform — failed.**
+
+XOR gives the "difference" between two bit vectors, but on 51-bit sparse binary vectors
+it produces a delta of ~20-30 flipped bits that creates too much noise when applied
+to a third vector. The result scatters across the SDR space rather than landing near
+the correct answer.
+
+**Second approach: soft float delta — kept.**
+
+Treat bit vectors as float arrays. Compute `delta = B - A` (continuous).
+Apply: `candidate = C + delta`. Resparsify by taking top-51 values.
+
+This preserves the "direction" of change (which dimensions increased, which decreased)
+without flipping every differing bit. Results are cleaner.
+
+**Honest limitation:** analogy only works when patterns have genuine structural similarity
+in their training sentences. "greeting:farewell::question:?" fails because the prototypes
+for abstract social categories don't encode a consistent geometric relationship.
+"kitten:cat::foal:horse" works because the sentences are parallel-structured
+("a ___ is a young ___", "___ are small and playful", etc.) and those shared
+structures create a learnable geometric relationship between young and adult.
+
+This is the same reason word2vec analogy works — it requires massive co-occurrence
+statistics to build up reliable vector directions. Our hash-based SDRs can approximate
+this only when the training examples explicitly encode the relationship.
+
+---
+
+**4. Cloze** — fill in the blank.
+
+```python
+sp.cloze("the ___ sat on the mat")          → "cat"    ✓
+sp.cloze("hello how are ___ doing today")   → "you"    ✓
+sp.cloze("neural networks learn from ___")  → "data"   ✓
+sp.cloze("heavy ___ fell all morning")      → "rain"   ✓
+sp.cloze("hot ___ on a cold day")           → "soup"   ✓
+sp.cloze("the ___ took off smoothly")       → "plane"  ✓
+```
+
+Ended up at 6/7 correct after three iterations of the strategy.
+
+**Iteration 1 (original):** searched all banks, picked filler at blank_pos, scored
+by how well the full completed sentence matched the prototype.
+
+Problem: "the ___ arrived at the station" → "learning" (wrong, expected "train").
+Reason: `"the ___ arrived..."` context matched `tech` as well as `transport`
+because stop words like "the" are everywhere. Tech examples have "learning" at
+position 1 ("deep **learning** uses..."), so "learning" accumulated score from
+the tech bank matching.
+
+**Iteration 2:** restricted search to top matching bank only, scored filled sentence
+vs prototype.
+
+Problem: "the ___ sat on the mat" → "bird" (wrong).
+Reason: the animal prototype bundles all four animal examples including "the bird..."
+so "the bird sat on the mat" scored higher against the prototype than "the cat sat".
+The prototype contains "bird" as a strong bit but "cat" is a weaker bit in the bundle.
+
+**Iteration 3 (final):** switched scoring to `context_sdr` vs `example-without-filler`.
+Ask "how well does this example (with the blank's word removed) match the context?"
+rather than "how well does the filled sentence match the prototype?".
+
+This is more direct — we want the example whose *surrounding words* best match the
+template's context. If "the cat sat on the mat" has its position-1 word removed,
+it becomes "the sat on the mat" which is essentially identical to the template
+"the ___ sat on the mat". Score = 1.0. Cat wins cleanly.
+
+Also: removed stop word filter from filler extraction. Stop words are valid answers
+("you", "it", "not") and filtering them caused "hello how are ___ doing today" to
+return "over" (from animal: "the bird flew over the trees") instead of "you".
+
+**Remaining miss:** "the ___ arrived at the station" → "with" (wrong).
+"arrived" is a unique word in the transport examples but the context SDR
+`"the arrived at the station"` shares too many stop-weighted bits with unrelated
+patterns to cleanly isolate transport. The filler at pos=1 in transport examples
+is "train", "on" (driving), "plane" — but "train" (pos=1 in "the train arrived...")
+gets outscored because "train" is also 0-weighted in the context and its example
+scores weakly against the context SDR.
+
+This is a known edge case: disambiguation fails when both the target word and its
+context words are all low-frequency or heavily stop-word-adjacent. Not fixed.
+
+---
+
+### Bugs fixed during v3.0 development
+
+1. **Stop word filter on cloze fillers** — removed. Stop words are valid answers.
+   Filtering them caused "you" to lose to "over" in a greeting template.
+
+2. **Cloze scoring strategy** — changed from "filled sentence vs prototype"
+   to "example-without-filler vs context". The old method was biased by the
+   prototype's bundle composition. The new method directly asks "which stored
+   sentence most resembles this context?"
+
+3. **Analogy XOR → soft delta** — XOR on sparse binary vectors produces too many
+   flipped bits. Soft float delta preserves directional information more cleanly.
+
+---
+
+### Final recall results
+
+```
+COMPLETION: 4/4 ✓
+  "hello how are"   → "you doing today"    [greeting 0.922]
+  "the cat sat"     → "on the mat"         [animal   0.941]
+  "neural networks" → "learn from data"    [tech     0.941]
+  "heavy rain"      → "fell all morning"   [weather  0.882]
+
+EXPECTATION: working for all patterns
+  Each label returns its most central stored example.
+
+ANALOGY: 2/3 ✓
+  kitten:cat::foal:horse  ✓  conf=0.275
+  puppy:dog::foal:horse   ✓  conf=0.216
+  kitten:cat::puppy:dog   ✗  got "horse"  (close: dog was #2 at 0.157)
+
+CLOZE: 6/7 ✓
+  "the ___ sat on the mat"          → cat    ✓
+  "hello how are ___ doing today"   → you    ✓
+  "neural networks learn from ___"  → data   ✓
+  "heavy ___ fell all morning"      → rain   ✓
+  "hot ___ on a cold day"           → soup   ✓
+  "the ___ took off smoothly"       → plane  ✓
+  "the ___ arrived at the station"  → with   ✗  (train expected)
+```
+
+---
+
+### Files changed this session
+
+```
+sym_pattern/recall.py   — NEW: RecallEngine with complete(), expect(), analogy(), cloze()
+sym_pattern/__init__.py — teach() now stores raw text; recall property + 4 new API methods
+```
+
+---
+
+### What v3.0 enables that wasn't possible before
+
+The system can now:
+- Start with a prompt fragment and retrieve the most likely continuation
+- Name a pattern and get back what it looks like
+- Perform structural analogical reasoning across learned patterns
+- Fill blanks in templates using learned knowledge
+
+Combined with v2.1 temporal memory (predict next pattern) and v2.0 hierarchy,
+the system can now:
+1. Observe a sequence of inputs (temporal)
+2. Recognize what patterns are occurring (recognition)
+3. Predict what comes next (temporal prediction)
+4. Generate a concrete example of that prediction (expectation + completion)
+
+That's a closed perception-prediction-generation loop. Small, fragile,
+hash-based — but structurally real.
+
+---
+
+### Known remaining limitations
+
+- Completion only slices stored examples, never generates new text
+- Analogy requires parallel sentence structure in training data
+- Cloze fails when context words are all stop-word-adjacent
+- No integration yet between recall and temporal/hierarchy modes
+
+---
+
+*Next: v3.1 — Symbol Graph (typed relationships between patterns: is-a, causes, before)*
 
 ---
 

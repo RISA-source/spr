@@ -20,6 +20,7 @@ from .temporal import TemporalMemory, TransitionGraph, SequencePatternMemory, Te
 from .context import ContextualTokenEncoder, ContextualSequenceEncoder, show_context_effect
 from . import persistence
 from . import fileops
+from .recall import RecallEngine, CompletionResult, ExpectationResult, AnalogyResult, ClozeResult
 
 
 class SymPattern:
@@ -86,6 +87,8 @@ class SymPattern:
             )
 
         self.unsupervised = unsupervised
+        self._text_bank: dict[str, list[str]] = {}
+        self._recall: RecallEngine | None = None
 
     # ------------------------------------------------------------------ #
     #  Core API (all modes)                                               #
@@ -93,6 +96,10 @@ class SymPattern:
 
     def teach(self, label: str, examples: list[str]):
         """Teach labeled examples. Works in all modes."""
+        if label not in self._text_bank:
+            self._text_bank[label] = []
+        self._text_bank[label].extend(examples)
+        self._recall = None  # invalidate cached recall engine
         for example in examples:
             sdr = self.encoder.encode(example)
             self.learner.teach(label, sdr)
@@ -211,6 +218,37 @@ class SymPattern:
         return self.learner.confidence_report()
 
     # ------------------------------------------------------------------ #
+    #  v3.0 — Active Recall                                              #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def recall(self) -> RecallEngine:
+        """Lazy-initialized RecallEngine. Rebuilt whenever new patterns are taught."""
+        if self._recall is None:
+            self._recall = RecallEngine(
+                memory=self.memory,
+                example_banks=self._text_bank,
+                encoder=self.encoder if isinstance(self.encoder, SequenceEncoder) else SequenceEncoder(),
+            )
+        return self._recall
+
+    def complete(self, partial: str, top_k: int = 3) -> list[CompletionResult]:
+        """Complete a partial input using stored examples as templates."""
+        return self.recall.complete(partial, top_k=top_k)
+
+    def expect(self, label: str) -> ExpectationResult | None:
+        """Generate a typical instance of a named pattern."""
+        return self.recall.expect(label)
+
+    def analogy(self, a: str, b: str, c: str) -> AnalogyResult | None:
+        """A is to B as C is to ? — symbolic vector arithmetic on prototypes."""
+        return self.recall.analogy(a, b, c)
+
+    def cloze(self, template: str, marker: str = "___") -> ClozeResult | None:
+        """Fill in the blank: 'The ___ sat on the mat' → 'cat'"""
+        return self.recall.cloze(template, marker=marker)
+
+    # ------------------------------------------------------------------ #
     #  Inspection                                                         #
     # ------------------------------------------------------------------ #
 
@@ -240,4 +278,5 @@ __all__ = [
     "TemporalMemory", "TransitionGraph", "SequencePatternMemory", "TemporalResult",
     "ContextualTokenEncoder", "ContextualSequenceEncoder", "show_context_effect",
     "persistence", "fileops",
+    "RecallEngine", "CompletionResult", "ExpectationResult", "AnalogyResult", "ClozeResult",
 ]
