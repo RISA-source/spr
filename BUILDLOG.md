@@ -354,17 +354,200 @@ composition × context flow × gradient-quality generalization. We have layer 1.
 
 ---
 
+---
+
+## BUILDLOG: v1.1 — Save / Load (Persistence)
+
+**Problem being solved:**  
+After every session, all learned patterns were gone. The system had no memory
+between runs. Completely unusable in any real workflow.
+
+**New module:** `persistence.py`
+
+Two formats supported by file extension:
+
+`.npz` (recommended) — numpy binary archive, compressed, fast.  
+Packs all prototype bit arrays into one file alongside labels, example counts,
+SDR size and match threshold. Can detect config mismatches on load.
+
+`.json` — human readable. Active indices stored as integer lists.  
+Useful for debugging, inspection, manual editing, or sending patterns to someone.
+Slower on large stores.
+
+**API added to `SymPattern`:**
+```python
+sp.save("patterns.npz")           # save
+sp2 = SymPattern.load("patterns.npz")   # restore
+```
+
+**Design decision — store active indices not full bit arrays in JSON:**  
+A full 1024-bit array as JSON would be a list of 1024 zeros and ones — unreadable
+and large. Storing only the ~51 active indices is compact and human-inspectable.
+NPZ stores the full bool array since numpy handles compression efficiently.
+
+**Design decision — validate SDR_SIZE on load:**  
+If someone saves with `SDR_SIZE=1024` and tries to load with `SDR_SIZE=2048`,
+all the patterns would silently be wrong — bits pointing to wrong positions.
+We detect this and raise a clear `ValueError` with instructions.
+
+**Test result:**
+```
+Loaded .npz → greeting: 0.451  ✓
+Loaded .json → farewell: 0.608 ✓
+```
+Both formats round-trip correctly. Patterns survive sessions.
+
+---
+
+## BUILDLOG: v1.2 — File Learning + File Similarity
+
+**Problem being solved:**  
+Couldn't learn from actual files. Couldn't compare two documents for similarity.
+These are the most natural use cases for a pattern recognition system.
+
+**New module:** `fileops.py`
+
+**`learn_from_file(sp, path, label=None)`**  
+Reads a file, chunks it, learns patterns from chunks.  
+If `label` given → supervised (all chunks are examples of that category).  
+If `label=None` → unsupervised (let patterns crystallize from recurrence).
+
+Chunking strategy by file type:
+- `.txt`/`.md` → split on blank lines (paragraph-aware), then by word count with overlap
+- `.csv` → one chunk per row (joined fields)
+- `.json` → one chunk per top-level list item or dict value
+
+**Design decision — overlapping chunks for text:**  
+Non-overlapping chunks cut across sentence boundaries, breaking semantic units.
+Using `chunk_size // 2` stride means adjacent chunks share half their words,
+so patterns that span a boundary still get captured.
+
+**`compare_files(sp, path_a, path_b)`**  
+Encodes both files as chunk SDRs, then for each chunk in A finds the best
+matching chunk in B, aggregates scores → overall similarity score.
+
+Returns `FileSimilarityReport` with:
+- `overall_score` — mean of best-match scores across all chunks of A
+- `top_pairs` — highest scoring chunk pairs (what actually matched)
+- `chunk_scores` — per-chunk score list (useful for plotting)
+
+**Test result with two test files (AI + weather topics):**
+```
+Overall similarity: 0.147
+Top pair (0.176): weather chunks matched each other  ✓
+Second pair (0.118): ML/AI chunks matched each other  ✓
+```
+The system correctly identified thematically similar sections across two
+files it had never been explicitly told anything about. Topic-sensitive
+without any supervised labels.
+
+**Bug during testing:**  
+File chunker was producing only 2 chunks for the test files because the
+whole AI paragraph and whole weather paragraph were each under `chunk_size=50`
+words, so they didn't get sub-chunked. Result was correct but showed that
+small files work at paragraph granularity, which is fine.
+
+---
+
+## BUILDLOG: v1.3 — Better On-The-Go Learning
+
+**Problem being solved:**  
+v1 learner was too discrete. It either promoted a pattern or it didn't.
+Once promoted, a pattern never got stronger from new observations.
+Candidates didn't decay, so stale/one-off inputs cluttered the candidate pool forever.
+No way to know how confident the system was in any given pattern.
+
+**Changes to `learner.py`:**
+
+**1. Continuous strengthening (Hebbian-style)**  
+Every time an input matches a known pattern (above threshold), we call
+`memory.learn()` again with that input — re-bundling it into the prototype.
+The prototype keeps improving with every matching observation, not just at
+the moment of promotion.
+
+Counter `_n_strengthened` tracks this. In v1 this was always 0.
+
+**2. Candidate decay**  
+Every `decay_every=50` observations, all candidates get their `strength`
+multiplied by `decay_rate=0.85`. Candidates that aren't re-seen fade away
+and get pruned when `strength < 0.1`.
+
+This prevents the candidate pool from filling up with one-off inputs that
+the system saw once and never again. Keeps memory clean.
+
+Candidate pruning now uses `strength × count` as the sort key rather than
+just `count` — a candidate seen 3 times recently is ranked above one seen
+5 times long ago but now faded.
+
+**3. Confidence tracking**  
+`PatternConfidence` dataclass tracks `match_count` and `total_score` per label.
+`confidence_report()` returns avg score per pattern — tells you which patterns
+the system recognizes reliably (high avg score) vs shakily (low avg score).
+
+**4. `on_the_go` mode**  
+When `on_the_go=True`:
+- `novelty_threshold` lowered by 0.05 (accepts weaker matches as "known")
+- `promotion_threshold` lowered by 1 (promotes patterns faster)
+- `candidate_match_threshold` lowered by 0.05 (more lenient candidate merging)
+
+Designed for live input streams where you want the system adapting quickly
+rather than being conservative.
+
+**Bug: missing `self.max_candidates` assignment**  
+When rewriting the learner, `max_candidates` was kept as a parameter but
+`self.max_candidates = max_candidates` was accidentally omitted from `__init__`.
+`_prune_candidates()` then crashed with `AttributeError` on first call.
+
+Fix: added the missing `self.max_candidates = max_candidates` line.
+
+**Lesson:** always grep for parameter names in methods before assuming they're assigned.
+
+**Test results:**
+```
+Stream of 8 inputs → 2 patterns promoted (ML cluster, cat cluster)  ✓
+"the cat naps on the mat" (unseen) → recognized at 0.529           ✓
+"deep learning is complex" (unseen) → recognized at 0.157          ✓  
+"quantum physics" → [novel]                                         ✓
+```
+
+---
+
+## State of the system after v1.1 → v1.3
+
+**Files:**
+```
+sym_pattern/
+  __init__.py    — SymPattern API (updated with save/load, learn_file, compare_files, confidence_report)
+  sdr.py         — SDR core (unchanged from v1)
+  encoder.py     — encoders (unchanged from v1)
+  memory.py      — pattern store (unchanged from v1)
+  learner.py     — v1.3: +decay, +continuous strengthening, +confidence, +on_the_go
+  persistence.py — NEW v1.1: save/load .npz and .json
+  fileops.py     — NEW v1.2: file learning and file comparison
+```
+
+**Capabilities now:**
+- All of v1: fuzzy matching, subword similarity, noise robustness, novelty/ambiguity detection
+- Patterns persist to disk and reload (v1.1)
+- Learn from .txt/.md/.csv/.json files (v1.2)
+- Compare two files for similarity with chunk-level detail (v1.2)
+- Continuous prototype strengthening from observations (v1.3)
+- Candidate decay — stale candidates auto-pruned (v1.3)
+- Confidence report per pattern (v1.3)
+- on_the_go mode for fast adaptation to live streams (v1.3)
+
+**Still not there yet (next targets):**
+- Hierarchical composition (v2.0) — biggest remaining gap to NN capability
+- Temporal / sequence memory (v2.1)
+- Context-sensitive encoding (v2.2)
+
+*Next entry: v2.0 — Hierarchical Pattern Composition*
+
+---
+
 ### What's missing — the roadmap
 
 Listed in priority order (each one is a meaningful capability jump):
-
-**v1.1 — Save/Load (trivial, ~20 lines)**  
-Serialize prototype SDRs (numpy arrays) to `.npz` or JSON.
-Load them back. Patterns persist between sessions.
-
-**v1.2 — File learning + similarity**  
-`sp.learn_from_file(path)` — chunk a file, learn patterns from it.  
-`sp.compare_files(path_a, path_b)` — score similarity section by section.
 
 **v2.0 — Hierarchical Pattern Composition**  
 Stack the pattern matcher on top of itself.  
@@ -393,4 +576,3 @@ our SDR system finally merge.
 ---
 
 *Log maintained by: Claude + developer, session by session.*  
-*Next entry: v1.1 — save/load + file learning*
