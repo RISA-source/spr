@@ -37,7 +37,7 @@ class SymPattern:
         mode: str = "flat",
         unsupervised: bool = False,
         subword_overlap: bool = True,
-        novelty_threshold: float = 0.25,
+        novelty_threshold: float = 0.20,  # lowered from 0.25 — better recall without sacrificing rejection
         promotion_threshold: int = 3,
         on_the_go: bool = False,
         n_layers: int = 3,
@@ -112,9 +112,16 @@ class SymPattern:
     def observe_corpus(self, texts: list[str]) -> list[MatchResult | None]:
         return [self.observe(t) for t in texts]
 
-    def recognize(self, text: str, top_k: int = 3) -> list[MatchResult]:
+    def recognize(self, text: str, top_k: int = 3, threshold: float = None) -> list[MatchResult]:
+        """
+        Recognize text against all learned patterns.
+        threshold: minimum score to include in results. Defaults to memory.match_threshold.
+                   Set to 0.0 to get all results regardless of score.
+        """
         sdr = self.encoder.encode(text)
-        return self.learner.recognize(sdr, top_k=top_k)
+        results = self.learner.recognize(sdr, top_k=top_k)
+        floor = threshold if threshold is not None else self.memory.match_threshold
+        return [r for r in results if r.score >= floor]
 
     def best_match(self, text: str) -> MatchResult | None:
         results = self.recognize(text, top_k=1)

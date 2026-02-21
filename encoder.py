@@ -22,6 +22,19 @@ from abc import ABC, abstractmethod
 from .sdr import SDR, SDR_SIZE, SDR_SPARSITY
 
 
+# Stop words — down-weighted in sequence encoding so content words dominate
+STOP_WORDS = {
+    "the","a","an","is","are","was","were","be","been","being",
+    "on","in","at","to","of","and","or","but","not","no",
+    "it","its","he","she","they","i","you","we","my","your",
+    "this","that","these","those","with","for","from","by","as",
+    "do","does","did","have","has","had","will","would","could",
+    "should","may","might","can","about","which","who","what",
+    "how","when","where","if","than","then","so","all","just",
+    "their","there","here","also","very","more","some","any",
+}
+
+
 # ------------------------------------------------------------------ #
 #  Base                                                                #
 # ------------------------------------------------------------------ #
@@ -186,9 +199,11 @@ class SequenceEncoder(Encoder):
 
         for pos, token in enumerate(tokens[:self.max_len]):
             token_sdr = self.token_encoder.encode(token)
-            shift = (pos * 17) % SDR_SIZE
+            shift = (pos * 3) % SDR_SIZE
             rotated = np.roll(token_sdr.bits, shift)
-            weight = 1.0 / (1.0 + pos * 0.1)
+            # Stop words get 10% weight — still present but don't dominate
+            stop_factor = 0.1 if token in STOP_WORDS else 1.0
+            weight = stop_factor / (1.0 + pos * 0.15)
             votes += rotated.astype(np.float32) * weight
 
         top_indices = np.argsort(votes)[-n_active:]
