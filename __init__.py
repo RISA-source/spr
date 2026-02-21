@@ -249,6 +249,44 @@ class SymPattern:
         return self.recall.cloze(template, marker=marker)
 
     # ------------------------------------------------------------------ #
+    #  v3.1 — Structural Description                                     #
+    # ------------------------------------------------------------------ #
+
+    def describe(self, label: str) -> dict | None:
+        """
+        Full structural description of a pattern.
+        Returns what DEFINES it: core, typical, peripheral, forbidden bit counts,
+        grounding status, and separability score.
+        """
+        return self.memory.describe(label)
+
+    def describe_all(self) -> dict:
+        """Structural description for every known pattern."""
+        return self.memory.describe_all()
+
+    def contrast(self, label_a: str, label_b: str) -> dict | None:
+        """
+        What distinguishes pattern A from pattern B?
+        Returns counts of bits that are core to A but forbidden in B (and vice versa).
+        High separability = clearly different patterns.
+        """
+        return self.memory.contrast(label_a, label_b)
+
+    def explain_match(self, text: str) -> str:
+        """
+        Recognize text and return a human-readable explanation of WHY it matched.
+        Shows which feature strata were present and how strongly.
+        """
+        results = self.recognize(text, top_k=1)
+        if not results:
+            return f"[no match / novel]  {text!r}"
+        return results[0].why()
+
+    def pattern_structure(self, label: str):
+        """Get the raw StructuredPrototype for a label."""
+        return self.memory.get_structured(label)
+
+    # ------------------------------------------------------------------ #
     #  Inspection                                                         #
     # ------------------------------------------------------------------ #
 

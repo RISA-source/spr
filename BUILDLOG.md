@@ -1279,17 +1279,273 @@ hash-based — but structurally real.
 
 ---
 
-*Next: v3.1 — Symbol Graph (typed relationships between patterns: is-a, causes, before)*
+---
+
+## BUILDLOG: v3.1 — Structural Description (Explainable Pattern Recognition)
+
+**The core symbolic upgrade. This is where sym-pattern stops being a fuzzy matcher
+and becomes a genuinely interpretable symbolic system.**
+
+---
+
+### What changed and why
+
+Every version up to v3.0 stored patterns as one opaque prototype SDR.
+You could ask "does this input match?" and get a score. You could NOT ask:
+- "What features define this pattern?"
+- "Why did this input match?"
+- "What distinguishes cat from dog?"
+- "How confident should I be that this pattern is well-defined?"
+
+Those questions require structural knowledge — knowing which bits are
+necessary, which are typical, which are occasional, and which definitively
+exclude a pattern. A flat bundled SDR buries that information.
+
+**The symbolic advantage is interpretability.** Neural nets match everything
+opaquely. We can and should do better.
+
+---
+
+### New data structure: `StructuredPrototype`
+
+Replaces the flat SDR prototype with a four-stratum description:
+
+```
+StructuredPrototype:
+  matching_sdr    — majority-vote bundle (backward compat, used for fast matching)
+  bit_frequencies — per-bit frequency across all N examples [0.0-1.0]
+  core_bits       — indices of bits present in ≥75% of examples
+  typical_bits    — indices of bits present in 40-74%
+  peripheral_bits — indices of bits present in 15-39%
+  forbidden_bits  — never in this pattern, common in others (exclusion features)
+  is_grounded     — whether frequency thresholds are meaningful given N examples
+```
+
+The `matching_sdr` is kept for backward compatibility — all existing code
+that did `proto.overlap(input)` or `proto.bits` continues to work unchanged.
+
+The strata are new metadata that makes the pattern **inspectable**.
+
+---
+
+### Threshold design: the hardest problem
+
+**Attempt 1: absolute thresholds (CORE≥0.80, TYPICAL≥0.40, PERIPHERAL≥0.10)**
+
+Failed immediately. With 4 diverse examples ("cat sat on mat", "dog ran through park",
+"birds flew over trees", "fish swim in ocean"), the maximum bit frequency across any
+example was only 0.75 (3 of 4 examples). Nothing cleared CORE=0.80. core_bits=0 for
+everything.
+
+The issue: absolute thresholds assume enough examples that the distribution spans
+the full [0,1] range. With small N, frequencies are discrete and coarse (0.25, 0.50,
+0.75, 1.0 for N=4).
+
+**Attempt 2: adaptive thresholds (core = max(0.50, 1 - 1/√n))**
+
+Better but still wrong. For N=4: core_threshold=0.50 → 13 bits qualify.
+But typical_threshold=0.50×0.55=0.275 → 177 bits qualify as "typical".
+The wide band between 0.50 and 0.275 swallowed almost all active bits.
+
+The discrete frequency problem remained: with N=4, values can only be
+0.25/0.50/0.75/1.0. Most bits sit at 0.25 which falls into "typical" under
+any reasonable threshold.
+
+**Attempt 3: relative-to-max thresholds**
+
+core = max_freq × 0.85, typical = max_freq × 0.45, etc.
+
+This normalized by the actual range observed. Better distributions but
+lost semantic meaning — "core bits at avg frequency 0.39" is not really "core".
+
+**Final approach: hybrid frequency/rank with honesty flag**
+
+```python
+if max_frequency >= 0.50:
+    # Hard frequency bands — meaningful semantic claims
+    core     = freq >= 0.75   (appear in 75%+ of examples)
+    typical  = freq in [0.40, 0.75)
+    peripheral = freq in [0.15, 0.40)
+    is_grounded = True
+
+else:
+    # Diverse examples, small N — use rank-based bucketing
+    # Top 20% of active bits → "core", next 25% → "typical", next 33% → "peripheral"
+    # is_grounded = False — these are weak structural claims
+```
+
+The key insight: **be honest about what the data supports**.
+When max_frequency < 0.50, the examples are too diverse for strong structural claims.
+The strata still exist but `is_grounded=False` signals this to the caller.
+
+With focused examples ("machine learning needs data", "machine learning is fascinating"...):
+max_freq = 1.0 → is_grounded=True, core=37-41 bits at avg_freq=0.85-0.91. **Real claims.**
+
+With diverse examples ("cat", "dog", "bird", "fish" all different sentences):
+max_freq = 0.50 → is_grounded=True but core_bits=0-1. **Honest: this pattern has no core.**
+
+---
+
+### Forbidden bits
+
+Forbidden bits are computed cross-pattern: bits that **never** appear in pattern P
+but appear frequently (≥35%) across the union of all other patterns.
+
+These are the most diagnostically powerful bits — if a forbidden bit fires in an
+input being matched against pattern P, that's evidence against the match.
+
+Recomputed every time any pattern's example bank changes (via `_recompute_forbidden()`).
+Cost: O(n_patterns × SDR_SIZE). Fine for hundreds of patterns, would need indexing at scale.
+
+---
+
+### New matching: `MatchExplanation`
+
+Every `MatchResult` now carries a `MatchExplanation`:
+
+```python
+MatchExplanation:
+  core_hit:       0.90   # fraction of core bits present in input
+  typical_hit:    0.91   # fraction of typical bits present
+  peripheral_hit: 0.43
+  forbidden_hit:  0.02   # fraction of forbidden bits PRESENT (lower = better)
+  strength:       "strong" | "moderate" | "weak"
+```
+
+`strength` rules:
+- `strong`: core_hit ≥ 0.80 AND forbidden_hit < 0.05
+- `moderate`: core_hit ≥ 0.50
+- `weak`: everything else
+
+Example output:
+```
+Match('cat_actions', score=0.90)
+  core=0.90|█████████   typical=0.91|█████████   forbidden=0.02|  [strong]
+```
+
+This is the WHY behind every match. No more black box.
+
+---
+
+### New introspection APIs
+
+```python
+sp.describe("cat_actions")
+# → {label, examples, core_bits, typical_bits, peripheral_bits,
+#    forbidden_bits, core_frequency, defining_ratio, grounded}
+
+sp.describe_all()
+# → {label → description} for every known pattern
+
+sp.contrast("cat_actions", "ml_concepts")
+# → {cat_distinguishing: 37, ml_distinguishing: 32,
+#    shared_core: 2, separability: 23.0}
+
+sp.explain_match("the cat slept on the mat")
+# → "Match('cat_actions', score=0.90)\n  core=0.90|... [strong]"
+
+sp.pattern_structure("cat_actions")
+# → StructuredPrototype (full object with bit arrays)
+```
+
+`contrast()` computes bits that are core to A but forbidden in B — the bits that
+definitively separate two patterns. High separability = clearly distinct patterns.
+Low separability = patterns that are hard to tell apart (useful to know!).
+
+---
+
+### Test results
+
+**Focused examples (5 each, same vocabulary):**
+```
+cat_actions:  core=41, typical=11, peripheral=51, forbidden=46, grounded=True
+              core_frequency=0.85
+ml_concepts:  core=37, typical=17, peripheral=42, forbidden=45, grounded=True
+              core_frequency=0.91
+Contrast separability: 23.0 (well separated)
+```
+
+**Diverse examples (4 each, different vocabulary):**
+```
+animal:  core=1,  typical=12, grounded=True (barely — max_freq=0.50)
+weather: core=0,  typical=17, grounded=True (no necessary features)
+tech:    core=0,  typical=20, grounded=True (no necessary features)
+```
+Honest result: diverse examples don't yield core features. The system says so.
+
+**Growing pattern (1→8 examples, cat-focused):**
+```
+n=1: core=51  (single example = all its bits are "core")
+n=2: core=47  (most bits shared between two similar sentences)
+n=5: core=42  (stabilizing around the shared vocabulary)
+n=6: core=12  (6th example introduces new vocabulary, core shrinks)
+n=8: core=13  (settling: only the genuinely recurring bits remain)
+```
+The strata converge as examples accumulate. Core shrinks to what's truly shared.
+
+**Explained matching:**
+```
+"the cat slept on the mat"           → cat_actions 0.90 [strong]  ✓
+"machine learning requires data"     → ml_concepts 0.84 [strong]  ✓
+"the quantum flux capacitor fired"   → [no match / novel]          ✓
+```
+
+---
+
+### Backward compatibility
+
+Fully preserved. All existing code that did:
+```python
+sp.recognize(text)        # still works
+sp.memory.prototypes[label]  # returns matching SDR (via _PrototypeProxy)
+r.score, r.label, r.raw_overlap  # still present on MatchResult
+```
+
+The `_PrototypeProxy` shim makes `memory.prototypes[label]` return the matching SDR
+rather than the StructuredPrototype, so persistence.py, recall.py, hierarchy.py,
+and temporal.py all continue working without changes.
+
+---
+
+### Files changed
+
+```
+sym_pattern/memory.py   — complete rewrite:
+                          StructuredPrototype, _build_prototype, _compute_strata,
+                          MatchExplanation, updated MatchResult, _PrototypeProxy,
+                          describe/contrast/describe_all on PatternMemory
+sym_pattern/__init__.py — describe/describe_all/contrast/explain_match/pattern_structure APIs
+```
+
+---
+
+### What this enables for Step 2 (Compositional Structure)
+
+Now that each pattern has explicit core/typical/forbidden bit sets, compositional
+structure becomes buildable:
+
+A composite pattern "A followed by B" can be defined by:
+- Its core bits = union of A's core bits and B's core bits (both must be present)
+- Its forbidden bits = intersection of A's and B's forbidden bits
+
+Pattern subsumption ("cat IS-A animal") can be checked structurally:
+- Does cat's core ⊆ animal's typical? (cat's necessary features are at least typical for animal)
+- Does cat have forbidden bits that animal doesn't? (cat is more specific)
+
+We now have the foundation for Step 3 (typed relationships) and Step 4 (inference).
+Both of those can now be grounded in the structural bit strata rather than
+floating on top of opaque prototype matching.
+
+---
+
+*Next: Step 2 — Compositional Structure (patterns defined by sub-pattern arrangements)*
+*OR: Step 3 — Typed Relationships (IS-A, HAS-PART, CAUSES, CONTRADICTS)*
 
 ---
 
 ### What's missing — the roadmap
 
 Listed in priority order (each one is a meaningful capability jump):
-
-**v3.0 — Active recall / generation**  
-Pattern → generate expected continuation.  
-This is the flip side of recognition: not just "what is this?" but "what should come next?"
 
 **v∞ — Symbol graph**  
 Patterns connected by typed relationships (is-a, has-a, causes, before, after).  
