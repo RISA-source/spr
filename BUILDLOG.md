@@ -536,12 +536,312 @@ sym_pattern/
 - Confidence report per pattern (v1.3)
 - on_the_go mode for fast adaptation to live streams (v1.3)
 
-**Still not there yet (next targets):**
-- Hierarchical composition (v2.0) — biggest remaining gap to NN capability
-- Temporal / sequence memory (v2.1)
-- Context-sensitive encoding (v2.2)
+---
 
-*Next entry: v2.0 — Hierarchical Pattern Composition*
+---
+
+## BUILDLOG: v2.0 — Hierarchical Pattern Composition
+
+**The big one. The largest single capability jump in the project so far.**
+
+**Problem being solved:**
+The flat single-layer system can recognize "cat" and "tech_topic" and "weather"
+but has no concept of abstraction levels. It can't recognize that
+[greeting → question → answer → farewell] is a conversation shape,
+because it only sees one pattern at a time, never compositions of patterns.
+
+Neural nets solve this by stacking layers where each layer transforms
+the previous layer's output into a higher-level representation.
+We need the same thing, symbolically and explicitly.
+
+**New module:** `hierarchy.py`
+
+**Architecture:**
+
+```
+Input text
+     ↓
+Layer 0 — PatternMemory — recognizes raw token/sequence patterns
+     ↓ (recognized label re-encoded as SDR)
+Layer 1 — PatternMemory — recognizes patterns-of-patterns
+     ↓ (recognized label re-encoded as SDR)
+Layer 2 — PatternMemory — recognizes patterns-of-patterns-of-patterns
+```
+
+Each layer has its own `PatternMemory` + `UnsupervisedLearner`.
+The key mechanism: when Layer N recognizes something, its recognized
+*label* gets encoded as an SDR and passed UP to Layer N+1 as input.
+Layer N+1 never sees raw text — it only sees what Layer N named.
+
+This is compositionality. Patterns made of patterns made of patterns.
+
+**`PatternLayer` class:**
+- `layer_id` — which level of the hierarchy
+- Own `PatternMemory` and `UnsupervisedLearner`
+- Own `label_encoder` (TokenEncoder) to re-encode recognized labels as SDRs
+- `process(input_sdr, learn=True)` → `LayerActivation`
+- `teach(label, sdr)` — supervised teaching at this specific layer
+
+**`LayerActivation` dataclass:**
+What one layer produces and passes to the next:
+- `input_sdr` — what came in
+- `matches` — what was recognized (list of MatchResult)
+- `activation_sdr` — the re-encoded label SDR for the next layer
+- `is_novel` — nothing matched
+
+**`HierarchicalSystem` class:**
+Stacks N `PatternLayer` objects. `process(sdr)` feeds through all layers
+bottom-up, collecting a `HierarchicalResult` with one activation per layer.
+
+Default layer config: novelty thresholds increase up the stack (upper layers
+are more conservative — they only fire on clear, repeated compositions).
+
+**`HierarchicalResult.summary()` output:**
+```
+L0:animal_action(0.35) → L1:[novel] → L2:[novel]
+```
+Shows exactly which level recognized what and at what confidence.
+
+---
+
+**Bug / design issue: `teach()` bypasses hierarchy layer 0**
+
+Initial implementation had `SymPattern.teach()` calling `self.learner.teach()`
+which writes only to the flat `PatternMemory`. But `hierarchy.layers[0]`
+had its own separate `PatternMemory`. So teaching a pattern and then calling
+`process_hierarchical()` produced no matches — layer 0 had an empty memory.
+
+**Root cause:** Two separate memory objects — one for flat mode, one for layer 0.
+
+**Fix:** Wire `hierarchy.layers[0].memory` and `hierarchy.layers[0].learner.memory`
+to point to the same `PatternMemory` as `sp.memory`. Done in `__init__.py` after
+hierarchy construction:
+
+```python
+self.hierarchy.layers[0].memory = self.memory
+self.hierarchy.layers[0].learner.memory = self.memory
+```
+
+Now `teach()`, `observe()`, and `process_hierarchical()` all operate on the
+same layer-0 knowledge store.
+
+**Test results after fix:**
+```
+'the cat ran across the mat'       L0:animal_action(0.35) ✓
+'neural networks are powerful'     L0:tech_topic(0.25)    ✓
+'cold and rainy all day today'     L0:weather(0.39)       ✓
+'the quantum flux capacitor fired' L0:animal_action(0.22) ← weak false positive
+```
+
+The "quantum flux" false positive is a known limitation: with only 3 categories
+and no explicit rejection mechanism, the system always finds *something* closest.
+This is common in all nearest-neighbor systems and will be addressed in a later
+version with a `rejection_threshold` at each layer.
+
+**L1 and L2 staying novel — expected behavior:**
+Upper layers need to see the same *label* appearing repeatedly as input to
+build second-level patterns. In a short test with 4 inputs that each map to
+a different category, labels never repeat at Layer 1. In a real corpus
+(hundreds of inputs), Layer 1 would see the same labels recur and start
+building composition patterns. This is correct and expected.
+
+---
+
+## BUILDLOG: v2.1 — Temporal Sequence Memory
+
+**Problem being solved:**
+The system sees each input in isolation. After recognizing "greeting" and
+"question" and "answer" in sequence, it has no memory that these appeared
+in order. It can't predict what comes next. It can't flag unusual sequences.
+It has no notion of discourse structure.
+
+**New module:** `temporal.py`
+
+**Three components:**
+
+**`TransitionGraph`**
+Directed weighted graph. Each `observe_transition(from, to)` call increments
+the edge `from → to`. Normalized → transition probabilities.
+
+`transition_probability(from, to)` uses Laplace smoothing (default 0.1)
+so unseen transitions get a small probability rather than zero.
+
+`surprise(from, to)` computes `-log2(P(to|from))`, normalized to 0–1.
+High surprise = this transition was unexpected given history.
+
+**`SequencePatternMemory`**
+Recognizes recurring sequences of labels (not just individual labels).
+Uses a sliding window over recent label history, encodes each window as
+a sequence SDR, observes it through an `UnsupervisedLearner`.
+Sequences that recur enough times get promoted to named sequence patterns.
+
+**`TemporalMemory`**
+Wraps a `PatternMemory` and adds temporal tracking:
+- `step(input_sdr)` → recognize + record transition + check sequence → `TemporalResult`
+- `predict_next(k)` → top-k expected next labels based on transition graph
+- `recent_surprises()` → list of surprising transitions (from, to, score)
+- `teach_sequence(label, [[labels...]])` → supervised sequence teaching
+
+**`TemporalResult` dataclass:**
+- `current_label` — what was recognized
+- `predictions` — what's expected next (list of (label, probability))
+- `surprise` — how unexpected was this transition
+- `sequence_match` — did recent history match a known sequence pattern
+
+---
+
+**Bug: predictions showed `candidate_X` labels instead of taught labels**
+
+First test run showed:
+```
+After 'greeting', predicts: [('candidate_2', 1.0)]
+```
+
+Instead of `('question', 1.0)`.
+
+**Root cause:** The test was calling `sp.observe(conv_text)` which runs through
+the unsupervised learner. If the taught labels weren't matching above threshold
+(because of score calibration), the learner created NEW candidate labels from
+the input instead of strengthening the existing taught patterns.
+The transition graph then recorded transitions between these auto-generated
+candidate labels, not the intended ones.
+
+**Fix:** Increased the number of teaching examples per category (3 instead of 1-2)
+so the prototype was rich enough to match subsequent observations above threshold.
+Confirmed that after teaching with 3 good examples, `observe()` correctly
+recognizes and strengthens the taught label rather than creating a new candidate.
+
+**Test results after fix:**
+```
+After 'greeting', predicts: [('question', 1.0)]      ✓
+After 'question', predicts: [('answer', 1.0)]         ✓
+Transition graph: 4 nodes, 18 transitions, 5 edges     ✓
+Surprise detected for unexpected farewell after greeting ✓
+```
+
+---
+
+## BUILDLOG: v2.2 — Context-Sensitive Encoding
+
+**Problem being solved:**
+"bank" in "river bank" and "bank" in "bank account" produce identical SDRs.
+The system cannot disambiguate word sense. Any phrase containing "bank" looks
+the same regardless of context.
+
+Formally: the encoder is context-independent. The same token string always
+maps to the same SDR, regardless of neighbors.
+
+**New module:** `context.py`
+
+**First approach tried: blended encoding**
+
+Idea: encode token normally, then blend neighbor SDRs in with weight `blend`:
+```
+final = (1 - blend) * base_sdr + blend * context_sdr
+then sparsify by taking top-N bits
+```
+
+Tested blend values 0.1 → 0.8.
+
+**Failed:** At any reasonable blend level (<0.6), the same top-51 bits were
+selected because the base word dominated the vote. "bank" always had the same
+51 highest-scoring dimensions regardless of context. Similarity stayed at 1.0.
+
+At blend=0.8 it dropped to 0.0 — the base identity was completely destroyed.
+No useful middle ground was found.
+
+**Second approach: partitioned SDR space**
+
+Insight: don't blend in the same space. Give context its OWN dedicated dimensions.
+
+Partition the 1024-bit SDR:
+- Bits 0..665 (65%) — word identity region (same word = same bits here always)
+- Bits 665..1024 (35%) — context region (neighbors determine these bits)
+
+"bank" in river context: base bits [identity of bank] + context bits [river/flood/water votes]
+"bank" in finance context: base bits [identity of bank] + context bits [account/money/finance votes]
+
+Result:
+- Same base identity → still recognized as the same word (overlap ~0.65)
+- Different context → partially different SDR (overlap drops to ~0.68 total)
+- `ctx_a_vs_ctx_b_similarity = 0.68` (was 1.0 with flat encoding)
+- `context_separates: True`
+
+**Design decision — BASE_RATIO = 0.65:**
+Tried 0.5 (equal split) — disambiguation was stronger but word identity
+similarity dropped too much (unrelated senses looked too different).
+Tried 0.8 (mostly base) — too little context effect.
+0.65/0.35 gives meaningful disambiguation while preserving enough base
+overlap that the system still recognizes the word as the same lexical item.
+
+**Test results:**
+```
+bank(river) ↔ bank(account) similarity: 0.68   (was 1.0)  ✓
+'good' vs 'not good':  0.667                               ✓
+'good' vs 'excellent': 0.784                               ✓
+```
+"good" and "not good" are now LESS similar than "good" and "excellent",
+which is semantically correct — "not good" has context bits from "not"
+which pull its representation away from pure positive territory.
+
+**Known limitation:**
+Context window is local (2 neighbors). Long-range disambiguation
+("the bank that I visited last year when I was fishing...") still fails.
+Full attention mechanism would be needed for that. Out of scope for v2.x.
+
+---
+
+## State of the system after v2.0 → v2.2
+
+**Files:**
+```
+sym_pattern/
+  __init__.py    — SymPattern with mode= param (flat/hierarchical/temporal/full)
+  sdr.py         — unchanged
+  encoder.py     — unchanged
+  memory.py      — unchanged
+  learner.py     — v1.3 (unchanged from last session)
+  persistence.py — v1.1 (unchanged)
+  fileops.py     — v1.2 (unchanged)
+  hierarchy.py   — NEW v2.0: PatternLayer, HierarchicalSystem, LayerActivation, HierarchicalResult
+  temporal.py    — NEW v2.1: TransitionGraph, SequencePatternMemory, TemporalMemory, TemporalResult
+  context.py     — NEW v2.2: ContextualTokenEncoder, ContextualSequenceEncoder (partitioned SDR)
+```
+
+**`SymPattern(mode=...)` options:**
+- `"flat"` — v1 behavior, single layer
+- `"hierarchical"` — stacked pattern layers (v2.0)
+- `"temporal"` — flat + transition graph + sequence patterns (v2.1)
+- `"full"` — all of the above + contextual encoding (v2.2)
+
+**Bugs caught this session:**
+1. Hierarchy layer 0 had separate memory from flat `sp.memory` — fixed by wiring to same object
+2. Temporal predictions showed `candidate_X` labels — fixed by ensuring enough teach examples for reliable prototype matching
+3. Context blend approach failed (all blends produce same top-N bits) — replaced with partitioned SDR space approach
+
+**Gap to NN-grade — honest current assessment:**
+
+What we have now that we didn't at v1:
+- Multi-level abstraction (hierarchy) — closes the biggest gap
+- Temporal/sequence understanding — covers RNN-like capability partially
+- Context-sensitive word representation — partial disambiguation
+
+What still separates us from a transformer:
+- Long-range context (our window=2, attention sees the whole sequence)
+- Gradient-quality generalization (we still use discrete promotion thresholds)
+- Learned representations (our SDRs are hash-derived, not trained from data statistics)
+- Scale (transformers have billions of parameters; we have hundreds of patterns)
+
+We are now roughly equivalent to: trigram language model + shallow HMM + local disambiguation.
+Better than v1 (bag-of-words tier). Still behind any trained neural model.
+The architecture is sound. The path to closing the remaining gap is clear.
+
+**Next targets:**
+- v2.3 — Rejection threshold (fix the "quantum flux = animal_action" false positive)
+- v3.0 — Active recall / generation (pattern → predict continuation)
+- v3.1 — Symbol graph (typed relationships between patterns: is-a, causes, before)
+
+*Next entry: v2.3 and beyond*
 
 ---
 
